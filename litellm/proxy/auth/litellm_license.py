@@ -22,6 +22,12 @@ LICENSE_ALL_FEATURES: Final = "*"
 AUTO_ROUTER_LICENSE_REMEDY: Final = "A LiteLLM license with the 'auto_router' feature lifts the limit."
 _LICENSE_VERDICT: Final = TypeAdapter(object)
 
+# Env vars that let a deployment white-label license verification. Both take
+# precedence over the bundled public_key.pem and are read once, at startup.
+LICENSE_PUBLIC_KEY_ENV_VAR: Final = "LITELLM_LICENSE_PUBLIC_KEY"
+LICENSE_PUBLIC_KEY_PATH_ENV_VAR: Final = "LITELLM_LICENSE_PUBLIC_KEY_PATH"
+_PEM_HEADER_MARKER: Final = "-----BEGIN"
+
 
 class LicenseCheck:
     """
@@ -40,22 +46,87 @@ class LicenseCheck:
         self.read_public_key()
         self.airgapped_license_data: EnterpriseLicenseData | None = None
 
-    def read_public_key(self):
+    def read_public_key(self) -> None:
+        """
+        Load the RSA public key used to verify local (air-gapped) license signatures.
+
+        Resolution order:
+        1. ``LITELLM_LICENSE_PUBLIC_KEY`` - PEM content (literal newlines, escaped ``\\n``,
+           surrounding quotes, or base64-encoded PEM).
+        2. ``LITELLM_LICENSE_PUBLIC_KEY_PATH`` - path to a PEM file, e.g. a mounted secret.
+        3. The bundled ``public_key.pem`` next to this module (default behavior).
+
+        A configured override never silently falls back to the bundled key: if it is set
+        but unreadable, ``public_key`` stays ``None`` so local verification fails closed
+        and the misconfiguration is logged.
+        """
+        self.public_key = None
         try:
             from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 
-            # current dir
-            current_dir: Final = os.path.dirname(os.path.realpath(__file__))
+            pem, source = self._load_public_key_pem()
+            if pem is None:
+                verbose_proxy_logger.debug("No license public key configured")
+                return
 
-            # check if public_key.pem exists
-            _path_to_public_key: Final = os.path.join(current_dir, "public_key.pem")
-            if os.path.exists(_path_to_public_key):
-                with open(_path_to_public_key, "rb") as key_file:
-                    self.public_key = serialization.load_pem_public_key(key_file.read())
-            else:
-                self.public_key = None
+            public_key = serialization.load_pem_public_key(pem)
+            if not isinstance(public_key, RSAPublicKey):
+                raise TypeError(f"expected an RSA public key, got {type(public_key).__name__}")
+
+            self.public_key = public_key
+            verbose_proxy_logger.debug("Loaded license public key from %s", source)
         except Exception as e:
             verbose_proxy_logger.error("Error reading public key: %s", e)
+
+    def _load_public_key_pem(self) -> tuple[bytes | None, str]:
+        """Return the configured PEM bytes and a loggable description of their source."""
+        env_value: Final = os.getenv(LICENSE_PUBLIC_KEY_ENV_VAR)
+        if env_value is not None and env_value.strip():
+            return self._decode_public_key_env(env_value), LICENSE_PUBLIC_KEY_ENV_VAR
+
+        env_path: Final = os.getenv(LICENSE_PUBLIC_KEY_PATH_ENV_VAR)
+        if env_path is not None and env_path.strip():
+            path: Final = env_path.strip()
+            with open(path, "rb") as key_file:
+                return key_file.read(), f"{LICENSE_PUBLIC_KEY_PATH_ENV_VAR}={path}"
+
+        # current dir
+        current_dir: Final = os.path.dirname(os.path.realpath(__file__))
+
+        # check if public_key.pem exists
+        _path_to_public_key: Final = os.path.join(current_dir, "public_key.pem")
+        if os.path.exists(_path_to_public_key):
+            with open(_path_to_public_key, "rb") as key_file:
+                return key_file.read(), f"bundled {_path_to_public_key}"
+
+        return None, "none"
+
+    @staticmethod
+    def _decode_public_key_env(value: str) -> bytes:
+        """Decode PEM content passed through an env var in any of the common shapes."""
+        raw: str = value.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1].strip()
+        if "\\n" in raw and "\n" not in raw:
+            raw = raw.replace("\\n", "\n")
+        if _PEM_HEADER_MARKER in raw:
+            return raw.encode()
+
+        try:
+            decoded: Final = base64.b64decode(raw, validate=False)
+        except Exception as e:
+            raise ValueError(
+                f"{LICENSE_PUBLIC_KEY_ENV_VAR} must be PEM content or base64-encoded PEM "
+                f"(use {LICENSE_PUBLIC_KEY_PATH_ENV_VAR} to point at a file)"
+            ) from e
+
+        if _PEM_HEADER_MARKER.encode() not in decoded:
+            raise ValueError(
+                f"{LICENSE_PUBLIC_KEY_ENV_VAR} must be PEM content or base64-encoded PEM "
+                f"(use {LICENSE_PUBLIC_KEY_PATH_ENV_VAR} to point at a file)"
+            )
+        return decoded
 
     def _verify(self, license_str: str) -> bool:
         verbose_proxy_logger.debug(

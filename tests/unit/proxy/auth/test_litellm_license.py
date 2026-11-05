@@ -1,14 +1,26 @@
 import json
 import logging
+from pathlib import Path
 from typing import Final
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
-from litellm.proxy.auth.litellm_license import LicenseCheck
+from litellm.proxy.auth.litellm_license import (
+    LICENSE_PUBLIC_KEY_ENV_VAR,
+    LICENSE_PUBLIC_KEY_PATH_ENV_VAR,
+    LicenseCheck,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_public_key_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's environment from leaking into key resolution tests."""
+    monkeypatch.delenv(LICENSE_PUBLIC_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv(LICENSE_PUBLIC_KEY_PATH_ENV_VAR, raising=False)
 
 
 def test_read_public_key_loads_successfully():
@@ -69,15 +81,36 @@ def test_auto_router_capability_limit() -> None:
     assert license_check.auto_router_capability_limit() == 1
 
 
+def _rsa_private_key() -> RSAPrivateKey:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _public_key_pem(private_key: RSAPrivateKey) -> str:
+    from cryptography.hazmat.primitives import serialization
+
+    return (
+        private_key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+
+
 def _signed_license(
-    expiration_date: str, allowed_features: tuple[str, ...] = ("auto_router",)
+    expiration_date: str,
+    allowed_features: tuple[str, ...] = ("auto_router",),
+    private_key: RSAPrivateKey | None = None,
 ) -> tuple[RSAPublicKey, str]:
     import base64
 
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = private_key or rsa.generate_private_key(public_exponent=65537, key_size=2048)
     message = json.dumps(
         {"expiration_date": expiration_date, "user_id": "u", "allowed_features": list(allowed_features)}
     ).encode()
@@ -276,3 +309,96 @@ def test_local_license_exception_does_not_log_license(
     assert license_check.verify_license_without_api_request(failing_public_key, license_value) is False
     assert "error_type=ValueError" in license_logs.text
     _assert_no_license_in_logs(license_logs, license_value)
+
+
+def test_public_key_env_var_overrides_bundled_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A white-labeled deployment can swap the bundled verification key for its own."""
+    private_key: Final = _rsa_private_key()
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, _public_key_pem(private_key))
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == private_key.public_key().public_numbers()
+
+    _, license_key = _signed_license("2999-01-01", private_key=private_key)
+    assert license_check.verify_license_without_api_request(license_check.public_key, license_key) is True
+
+
+def test_public_key_env_var_accepts_escaped_newlines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docker/.env values often carry newlines as literal backslash-n sequences."""
+    private_key: Final = _rsa_private_key()
+    escaped_pem: Final = _public_key_pem(private_key).replace(chr(10), chr(92) + "n")
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, escaped_pem)
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == private_key.public_key().public_numbers()
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_public_key_env_var_accepts_quoted_values(monkeypatch: pytest.MonkeyPatch, quote: str) -> None:
+    private_key: Final = _rsa_private_key()
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, quote + _public_key_pem(private_key) + quote)
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == private_key.public_key().public_numbers()
+
+
+def test_public_key_env_var_accepts_base64(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    private_key: Final = _rsa_private_key()
+    encoded: Final = base64.b64encode(_public_key_pem(private_key).encode()).decode()
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, encoded)
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == private_key.public_key().public_numbers()
+
+
+def test_public_key_path_env_var(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    private_key: Final = _rsa_private_key()
+    key_file: Final = tmp_path / "oem_public_key.pem"
+    key_file.write_text(_public_key_pem(private_key))
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_PATH_ENV_VAR, str(key_file))
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == private_key.public_key().public_numbers()
+
+
+def test_public_key_content_env_var_takes_precedence_over_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    content_key: Final = _rsa_private_key()
+    path_key: Final = _rsa_private_key()
+    key_file: Final = tmp_path / "oem_public_key.pem"
+    key_file.write_text(_public_key_pem(path_key))
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, _public_key_pem(content_key))
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_PATH_ENV_VAR, str(key_file))
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is not None
+    assert license_check.public_key.public_numbers() == content_key.public_key().public_numbers()
+
+
+def test_invalid_public_key_override_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A misconfigured override must not silently fall back to the bundled key."""
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_ENV_VAR, "not-a-public-key")
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is None
+
+
+def test_missing_public_key_path_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(LICENSE_PUBLIC_KEY_PATH_ENV_VAR, str(tmp_path / "missing.pem"))
+
+    license_check: Final = LicenseCheck()
+
+    assert license_check.public_key is None
